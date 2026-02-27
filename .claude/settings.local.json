@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python -m pytest test/utils/test_project_utils.py -v)",
+      "Bash(.venv/Scripts/python -m unittest test.utils.test_project_utils -v)",
+      "Bash(.venv/Scripts/python -m uv dist-build -o dist/)",
+      "Bash(.venv/Scripts/python -m pip install uv)",
+      "Bash(.venv/Scripts/python -m ensurepip)",
+      "Bash(.venv/Scripts/python -m uv venv)",
+      "Bash(.venv/Scripts/python -m pip install build twine)",
+      "Bash(.venv/Scripts/python -m build)",
+      "Bash(.venv/Scripts/python -m twine upload dist/*)",
+      "Bash(.venv/Scripts/python -m twine upload --disable-progress-bar --repository-url https://upload.pypi.org/legacy/ dist/*)",
+      "Bash(TWINE_USERNAME=__token__ TWINE_PASSWORD=$PYPI_TOKEN .venv/Scripts/python -m twine upload --disable-progress-bar --non-interactive dist/*)",
+      "Bash(echo \"PYPI_TOKEN: $PYPI_TOKEN\")",
+      "Bash(printenv)",
+      "Bash(echo $PYPI_TOKEN)",
+      "Bash(uv publish)",
+      "Bash(uv publish --token $PYPI_TOKEN)",
+      "Bash(uv build)",
+      "Bash(git init)",
+      "Bash(git remote add origin git@github.com:HuangZurong/py-flashboot-core.git)",
+      "Bash(git add .)",
+      "Bash(git commit -m \"feat: Initial commit and publish v0.1.25\")",
+      "Bash(git push -u origin main)"
+    ]
+  }
+}

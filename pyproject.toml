@@ -1,0 +1,20 @@
+[project]
+name = "flashboot-core"
+version = "0.1.25"
+description = "A lightning-fast, Spring Boot-inspired framework for Python."
+requires-python = ">=3.10"
+dependencies = [
+    "commons-lang>=0.2.13",
+    "loguru>=0.7.3",
+    "pydantic>=2.11.4",
+    "pydantic-yaml>=1.4.0",
+    "pyyaml>=6.0.2",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flashboot_core*"]
+exclude = ["tests*", "resources*"]
