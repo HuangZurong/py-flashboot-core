@@ -20,6 +20,9 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# Claude Code
+.claude/
+
 # Env
 .env
 .env.*
