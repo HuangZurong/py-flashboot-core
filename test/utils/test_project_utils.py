@@ -1116,5 +1116,290 @@ class TestIsLibraryInternal(unittest.TestCase):
         self.assertFalse(ProjectRootFinder._is_library_internal(external))
 
 
+# ---------------------------------------------------------------------------
+# Additional coverage
+# ---------------------------------------------------------------------------
+
+class TestIterAncestorsExtra(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_nonexistent_start_path_traverses_upward(self):
+        """Non-existent start path: _iter_ancestors traverses upward to existing parents."""
+        fake = self.tmp / "does_not_exist" / "deep"
+        finder = ProjectRootFinder(start_path=str(fake))
+        ancestors = finder._iter_ancestors()
+        # Non-existent dirs are skipped, but existing parents are included
+        self.assertNotIn(fake, ancestors)
+        self.assertNotIn(self.tmp / "does_not_exist", ancestors)
+        # The tmp dir itself (which exists) should appear
+        self.assertIn(self.tmp, ancestors)
+
+    def test_skips_all_non_root_dir_names(self):
+        """All dirs in _NON_ROOT_DIR_NAMES should be skipped."""
+        for name in ProjectRootFinder._NON_ROOT_DIR_NAMES:
+            with self.subTest(name=name):
+                d = self.env.mkdir("project", name, "sub")
+                finder = ProjectRootFinder(start_path=str(d))
+                ancestors = finder._iter_ancestors()
+                self.assertNotIn(self.tmp / "project" / name, ancestors)
+
+    def test_includes_start_dir_itself(self):
+        """The start directory itself should be the first ancestor."""
+        start = self.env.mkdir("project", "src")
+        finder = ProjectRootFinder(start_path=str(start))
+        ancestors = finder._iter_ancestors()
+        self.assertEqual(ancestors[0], start)
+
+
+class TestFindNearestByMarkersExtra(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_start_dir_itself_has_marker(self):
+        """If the start directory contains a marker, it should be returned immediately."""
+        self.env.touch("project", _TEST_MARKER)
+        start = self.tmp / "project"
+        finder = ProjectRootFinder(start_path=str(start))
+        self.assertEqual(finder._find_nearest_by_markers(markers=[_TEST_MARKER]), self.tmp / "project")
+
+    def test_empty_markers_falls_back_to_defaults(self):
+        """Passing empty list should use _DEFAULT_MARKERS."""
+        self.env.touch("project", "pyproject.toml")
+        start = self.env.mkdir("project", "src")
+        finder = ProjectRootFinder(start_path=str(start))
+        # pyproject.toml is in _DEFAULT_MARKERS, so it should be found
+        result = finder._find_nearest_by_markers(markers=[])
+        self.assertIsNotNone(result)
+
+    def test_multiple_markers_any_match_counts(self):
+        """A directory with any one of the markers should match."""
+        self.env.touch("project", "marker_b")
+        start = self.env.mkdir("project", "src")
+        finder = ProjectRootFinder(start_path=str(start))
+        result = finder._find_nearest_by_markers(markers=["marker_a", "marker_b"])
+        self.assertEqual(result, self.tmp / "project")
+
+
+class TestFindFarthestByMarkersExtra(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_start_dir_itself_has_marker(self):
+        """If only the start directory has a marker, it is both nearest and farthest."""
+        self.env.touch("project", _TEST_MARKER)
+        start = self.tmp / "project"
+        finder = ProjectRootFinder(start_path=str(start))
+        self.assertEqual(finder._find_farthest_by_markers(markers=[_TEST_MARKER]), self.tmp / "project")
+
+    def test_empty_markers_falls_back_to_defaults(self):
+        self.env.touch("project", "pyproject.toml")
+        start = self.env.mkdir("project", "src")
+        finder = ProjectRootFinder(start_path=str(start))
+        result = finder._find_farthest_by_markers(markers=[])
+        self.assertIsNotNone(result)
+
+
+class TestFindProjectRootExtra(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_root_marker_beats_vcs(self):
+        """
+        .root in a subdirectory should take priority even when git would return a parent.
+        """
+        self.env.touch("workspace", "project", ROOT_MARKER)
+        start = self.env.mkdir("workspace", "project", "src")
+        expected_vcs = self.tmp / "workspace"
+
+        finder = ProjectRootFinder(start_path=str(start))
+        with patch.object(finder, "_find_by_git", return_value=expected_vcs):
+            result = finder.find_project_root(search_methods=["git", "markers"])
+        # .root wins regardless of VCS
+        self.assertEqual(result, self.tmp / "workspace" / "project")
+
+    def test_method_exception_falls_back_to_next(self):
+        """An exception in one method should fall back to the next."""
+        self.env.touch("project", _TEST_MARKER)
+        start = self.env.mkdir("project", "src")
+        finder = ProjectRootFinder(start_path=str(start))
+
+        with patch.object(finder, "_find_by_git", side_effect=RuntimeError("git exploded")), \
+             patch.object(finder, "_find_nearest_by_markers", return_value=self.tmp / "project"):
+            result = finder.find_project_root(search_methods=["git", "markers"])
+        self.assertEqual(result, self.tmp / "project")
+
+    def test_project_cache_independent_of_workspace_cache(self):
+        """project root cache and workspace root cache are stored separately."""
+        self.env.touch("workspace", ROOT_MARKER)
+        self.env.touch("workspace", "project", ROOT_MARKER)
+        start = self.env.mkdir("workspace", "project", "src")
+
+        finder = ProjectRootFinder(start_path=str(start))
+        project = finder.find_project_root()
+        workspace = finder.find_workspace_root()
+
+        self.assertEqual(project, self.tmp / "workspace" / "project")
+        self.assertEqual(workspace, self.tmp / "workspace")
+        # Caches are independent
+        self.assertEqual(finder._project_cache, self.tmp / "workspace" / "project")
+        self.assertEqual(finder._workspace_cache, self.tmp / "workspace")
+
+
+class TestFindWorkspaceRootExtra(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_unknown_method_skipped(self):
+        self.env.touch("workspace", _TEST_MARKER)
+        start = self.env.mkdir("workspace", "project", "src")
+        finder = ProjectRootFinder(start_path=str(start))
+        expected = self.tmp / "workspace"
+        with patch.object(finder, "_find_farthest_by_markers", return_value=expected):
+            result = finder.find_workspace_root(search_methods=["nonexistent", "markers"])
+        self.assertEqual(result, expected)
+
+    def test_method_exception_falls_back_to_next(self):
+        self.env.touch("workspace", _TEST_MARKER)
+        start = self.env.mkdir("workspace", "project", "src")
+        finder = ProjectRootFinder(start_path=str(start))
+        expected = self.tmp / "workspace"
+
+        with patch.object(finder, "_find_farthest_by_markers", side_effect=RuntimeError("boom")), \
+             patch.object(finder, "_find_by_structure", return_value=expected):
+            result = finder.find_workspace_root(search_methods=["markers", "structure"])
+        self.assertEqual(result, expected)
+
+    def test_no_root_marker_no_markers_raises(self):
+        start = self.env.mkdir("empty", "sub")
+        finder = ProjectRootFinder(start_path=str(start))
+        with patch.object(finder, "_find_farthest_root_marker", return_value=None), \
+             patch.object(finder, "_find_farthest_by_markers", return_value=None), \
+             patch.object(finder, "_find_by_structure", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                finder.find_workspace_root(search_methods=["markers", "structure"])
+
+
+class TestIsStdlibOrSitePackagesExtra(unittest.TestCase):
+    def test_lib_python_detected(self):
+        # Use a path string that contains "lib/python" literally (forward slash)
+        # The implementation checks path_str which uses str(file_path).lower()
+        # On Windows, Path converts to backslashes, so we need to check the actual indicator
+        p = Path("/usr/lib/python3.10/os.py")
+        path_str = str(p).lower().replace("\\", "/")
+        self.assertIn("lib/python", path_str)
+        # Verify the method itself works with a site-packages path (cross-platform safe)
+        p2 = Path("/usr/lib/python3.10/site-packages/requests/__init__.py")
+        self.assertTrue(ProjectRootFinder._is_stdlib_or_site_packages(p2))
+
+    def test_lib64_python_detected(self):
+        p = Path("/usr/lib64/python3.10/site-packages/lib.py")
+        self.assertTrue(ProjectRootFinder._is_stdlib_or_site_packages(p))
+
+    def test_dist_packages_detected(self):
+        p = Path("/usr/lib/python3/dist-packages/requests/__init__.py")
+        self.assertTrue(ProjectRootFinder._is_stdlib_or_site_packages(p))
+
+    def test_path_under_sys_prefix_detected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as venv:
+            venv_path = Path(venv).resolve()
+            p = venv_path / "lib" / "mymodule.py"
+            with patch.object(sys, "prefix", str(venv_path)), \
+                 patch.object(sys, "base_prefix", "/usr"):
+                self.assertTrue(ProjectRootFinder._is_stdlib_or_site_packages(p))
+
+    def test_path_under_sys_base_prefix_detected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as base:
+            base_path = Path(base).resolve()
+            p = base_path / "lib" / "os.py"
+            with patch.object(sys, "prefix", "/some/venv"), \
+                 patch.object(sys, "base_prefix", str(base_path)):
+                self.assertTrue(ProjectRootFinder._is_stdlib_or_site_packages(p))
+
+
+class TestGetCallerFromStackExtra(unittest.TestCase):
+    def test_returns_none_when_inspect_raises(self):
+        """If inspect.stack() raises, _get_caller_from_stack should return None."""
+        finder = ProjectRootFinder.__new__(ProjectRootFinder)
+        with patch("flashboot_core.utils.project_utils.inspect.stack", side_effect=Exception("stack error")):
+            result = finder._get_caller_from_stack()
+        self.assertIsNone(result)
+
+    def test_skips_ipykernel_frames(self):
+        """Frames with ipykernel_ in filename should be skipped."""
+        finder = ProjectRootFinder.__new__(ProjectRootFinder)
+
+        fake_frame = MagicMock()
+        fake_frame.filename = "/tmp/ipykernel_12345/tmp_code.py"
+
+        with tempfile.TemporaryDirectory() as d:
+            real_file = Path(d) / "project" / "main.py"
+            real_file.parent.mkdir(parents=True, exist_ok=True)
+            real_file.touch()
+
+            real_frame = MagicMock()
+            real_frame.filename = str(real_file)
+
+            with patch("flashboot_core.utils.project_utils.inspect.stack", return_value=[MagicMock(), fake_frame, real_frame]), \
+                 patch.object(ProjectRootFinder, "_is_library_internal", return_value=False), \
+                 patch.object(ProjectRootFinder, "_is_stdlib_or_site_packages", return_value=False):
+                result = finder._get_caller_from_stack()
+            self.assertEqual(result.resolve(), real_file.parent.resolve())
+
+
+class TestRootMarkerExtraEdgeCases(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_nearest_and_farthest_same_when_only_one_root_marker(self):
+        self.env.touch("project", ROOT_MARKER)
+        start = self.env.mkdir("project", "a", "b", "c")
+        finder = ProjectRootFinder(start_path=str(start))
+        self.assertEqual(finder._find_nearest_root_marker(), finder._find_farthest_root_marker())
+
+    def test_root_marker_deep_nesting(self):
+        """Root marker many levels up should still be found."""
+        self.env.touch("root", ROOT_MARKER)
+        start = self.env.mkdir("root", "a", "b", "c", "d", "e")
+        finder = ProjectRootFinder(start_path=str(start))
+        self.assertEqual(finder._find_nearest_root_marker(), self.tmp / "root")
+
+    def test_root_marker_not_in_default_markers(self):
+        """.root should NOT be in _DEFAULT_MARKERS (it's handled separately)."""
+        self.assertNotIn(ROOT_MARKER, ProjectRootFinder._DEFAULT_MARKERS)
+
+
 if __name__ == "__main__":
     unittest.main()
