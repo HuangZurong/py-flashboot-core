@@ -4,7 +4,14 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 import tempfile
 
-from flashboot_core.utils.project_utils import ProjectRootFinder, _LIBRARY_ROOT
+from flashboot_core.utils.project_utils import (
+    ProjectRootFinder,
+    _LIBRARY_ROOT,
+    ROOT_MARKER,
+    get_project_root,
+    get_workspace_root,
+    setup_import_path,
+)
 
 
 class DirectoryEnvironment:
@@ -365,7 +372,7 @@ class TestFindByVCS(unittest.TestCase):
 
 
 class TestFindRoot(unittest.TestCase):
-    """Test the find_root orchestration method with mocked strategies."""
+    """Test the find_project_root orchestration method with mocked strategies."""
 
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
@@ -385,8 +392,8 @@ class TestFindRoot(unittest.TestCase):
 
         finder = self._finder(start)
         with patch.object(finder, "_find_by_git", return_value=expected) as mock_git, \
-             patch.object(finder, "_find_by_markers") as mock_markers:
-            result = finder.find_root(search_methods=["git", "markers"])
+             patch.object(finder, "_find_nearest_by_markers") as mock_markers:
+            result = finder.find_project_root(search_methods=["git", "markers"])
             self.assertEqual(result, expected)
             mock_git.assert_called_once()
             mock_markers.assert_not_called()
@@ -398,8 +405,8 @@ class TestFindRoot(unittest.TestCase):
 
         finder = self._finder(start)
         with patch.object(finder, "_find_by_git", return_value=None), \
-             patch.object(finder, "_find_by_markers", return_value=expected):
-            result = finder.find_root(search_methods=["git", "markers"])
+             patch.object(finder, "_find_nearest_by_markers", return_value=expected):
+            result = finder.find_project_root(search_methods=["git", "markers"])
             self.assertEqual(result, expected)
 
     def test_fallback_when_first_raises(self):
@@ -409,8 +416,8 @@ class TestFindRoot(unittest.TestCase):
 
         finder = self._finder(start)
         with patch.object(finder, "_find_by_git", side_effect=RuntimeError("boom")), \
-             patch.object(finder, "_find_by_markers", return_value=expected):
-            result = finder.find_root(search_methods=["git", "markers"])
+             patch.object(finder, "_find_nearest_by_markers", return_value=expected):
+            result = finder.find_project_root(search_methods=["git", "markers"])
             self.assertEqual(result, expected)
 
     def test_cache_returns_same_result(self):
@@ -419,11 +426,10 @@ class TestFindRoot(unittest.TestCase):
         expected = self.tmp / "project"
 
         finder = self._finder(start)
-        with patch.object(finder, "_find_by_markers", return_value=expected) as mock:
-            result1 = finder.find_root(search_methods=["markers"])
-            result2 = finder.find_root(search_methods=["markers"])
+        with patch.object(finder, "_find_nearest_by_markers", return_value=expected) as mock:
+            result1 = finder.find_project_root(search_methods=["markers"])
+            result2 = finder.find_project_root(search_methods=["markers"])
             self.assertEqual(result1, result2)
-            # Only called once due to caching
             mock.assert_called_once()
 
     def test_raises_when_all_methods_fail(self):
@@ -431,10 +437,11 @@ class TestFindRoot(unittest.TestCase):
         start = self.env.mkdir("empty", "nothing")
 
         finder = self._finder(start)
-        with patch.object(finder, "_find_by_markers", return_value=None), \
+        with patch.object(finder, "_find_nearest_root_marker", return_value=None), \
+             patch.object(finder, "_find_nearest_by_markers", return_value=None), \
              patch.object(finder, "_find_by_structure", return_value=None):
             with self.assertRaises(FileNotFoundError):
-                finder.find_root(search_methods=["markers", "structure"])
+                finder.find_project_root(search_methods=["markers", "structure"])
 
     def test_unknown_method_skipped(self):
         """Unknown search method names are skipped gracefully."""
@@ -442,8 +449,8 @@ class TestFindRoot(unittest.TestCase):
         expected = self.tmp / "project"
 
         finder = self._finder(start)
-        with patch.object(finder, "_find_by_markers", return_value=expected):
-            result = finder.find_root(search_methods=["nonexistent", "markers"])
+        with patch.object(finder, "_find_nearest_by_markers", return_value=expected):
+            result = finder.find_project_root(search_methods=["nonexistent", "markers"])
             self.assertEqual(result, expected)
 
 
@@ -690,33 +697,381 @@ class TestGetMainScriptPath(unittest.TestCase):
             self.assertIsNone(result)
 
 
-class TestEnsureSearchPath(unittest.TestCase):
-    """Test ensure_search_path side effects."""
+class TestSetupImportPath(unittest.TestCase):
+    """Test setup_import_path side effects."""
 
     def test_adds_root_to_sys_path(self):
-        from flashboot_core.utils.project_utils import ensure_search_path
-        fake_root = str(Path("/fake/project/root"))  # normalize for OS
-        with patch("flashboot_core.utils.project_utils.get_root_path", return_value=Path(fake_root)):
-            # Remove if already present
-            while fake_root in sys.path:
-                sys.path.remove(fake_root)
-            ensure_search_path()
-            self.assertIn(fake_root, sys.path)
-            # Cleanup
-            sys.path.remove(fake_root)
+        fake_root = Path("/fake/project/root")
+        while str(fake_root) in sys.path:
+            sys.path.remove(str(fake_root))
+        setup_import_path(root=fake_root)
+        self.assertIn(str(fake_root), sys.path)
+        sys.path.remove(str(fake_root))
 
     def test_does_not_duplicate_in_sys_path(self):
-        from flashboot_core.utils.project_utils import ensure_search_path
-        fake_root = str(Path("/fake/project/root_no_dup"))  # normalize for OS
-        with patch("flashboot_core.utils.project_utils.get_root_path", return_value=Path(fake_root)):
-            sys.path.append(fake_root)
-            count_before = sys.path.count(fake_root)
-            ensure_search_path()
-            count_after = sys.path.count(fake_root)
-            self.assertEqual(count_before, count_after)
-            # Cleanup
-            while fake_root in sys.path:
-                sys.path.remove(fake_root)
+        fake_root = Path("/fake/project/root_no_dup")
+        sys.path.append(str(fake_root))
+        count_before = sys.path.count(str(fake_root))
+        setup_import_path(root=fake_root)
+        self.assertEqual(sys.path.count(str(fake_root)), count_before)
+        while str(fake_root) in sys.path:
+            sys.path.remove(str(fake_root))
+
+    def test_defaults_to_get_project_root(self):
+        fake_root = Path("/fake/auto/root")
+        with patch("flashboot_core.utils.project_utils.get_project_root", return_value=fake_root):
+            while str(fake_root) in sys.path:
+                sys.path.remove(str(fake_root))
+            setup_import_path()
+            self.assertIn(str(fake_root), sys.path)
+            while str(fake_root) in sys.path:
+                sys.path.remove(str(fake_root))
+
+
+class TestRootMarker(unittest.TestCase):
+    """Test .root marker file detection."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _finder(self, start: Path) -> ProjectRootFinder:
+        return ProjectRootFinder(start_path=str(start))
+
+    def test_nearest_root_marker_found(self):
+        """
+        workspace/
+          service-a/    <- .root here
+            src/
+              caller    <- start here
+        """
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        result = finder._find_nearest_root_marker()
+        self.assertEqual(result, self.tmp / "workspace" / "service-a")
+
+    def test_nearest_root_marker_picks_closest(self):
+        """
+        workspace/      <- .root here
+          service-a/    <- .root here too
+            src/        <- start here
+        Nearest should be service-a.
+        """
+        self.env.touch("workspace", ROOT_MARKER)
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        result = finder._find_nearest_root_marker()
+        self.assertEqual(result, self.tmp / "workspace" / "service-a")
+
+    def test_farthest_root_marker_picks_outermost(self):
+        """
+        workspace/      <- .root here
+          service-a/    <- .root here too
+            src/        <- start here
+        Farthest should be workspace.
+        """
+        self.env.touch("workspace", ROOT_MARKER)
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        result = finder._find_farthest_root_marker()
+        self.assertEqual(result, self.tmp / "workspace")
+
+    def test_no_root_marker_returns_none(self):
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        self.assertIsNone(finder._find_nearest_root_marker())
+        self.assertIsNone(finder._find_farthest_root_marker())
+
+    def test_root_marker_at_start_path(self):
+        """If .root is in the start directory itself, it should be found."""
+        self.env.touch("project", ROOT_MARKER)
+        start = self.tmp / "project"
+
+        finder = self._finder(start)
+        self.assertEqual(finder._find_nearest_root_marker(), self.tmp / "project")
+        self.assertEqual(finder._find_farthest_root_marker(), self.tmp / "project")
+
+
+class TestFindProjectRoot(unittest.TestCase):
+    """Test find_project_root (nearest root)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _finder(self, start: Path) -> ProjectRootFinder:
+        return ProjectRootFinder(start_path=str(start))
+
+    def test_root_marker_takes_priority_over_markers(self):
+        """
+        workspace/          <- pyproject.toml (would normally win by score)
+          service-a/        <- .root
+            src/            <- start
+        .root should win.
+        """
+        self.env.touch("workspace", "pyproject.toml")
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        result = finder.find_project_root(search_methods=["markers"])
+        self.assertEqual(result, self.tmp / "workspace" / "service-a")
+
+    def test_returns_nearest_marker_dir(self):
+        """
+        workspace/          <- pyproject.toml
+          service-a/        <- pyproject.toml (nearest)
+            src/            <- start
+        Should return service-a, not workspace.
+        """
+        self.env.touch("workspace", "pyproject.toml")
+        self.env.touch("workspace", "service-a", "pyproject.toml")
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        result = finder.find_project_root(search_methods=["markers"])
+        self.assertEqual(result, self.tmp / "workspace" / "service-a")
+
+    def test_raises_when_nothing_found(self):
+        start = self.env.mkdir("empty", "sub")
+
+        finder = self._finder(start)
+        with patch.object(finder, "_find_nearest_root_marker", return_value=None), \
+             patch.object(finder, "_find_nearest_by_markers", return_value=None), \
+             patch.object(finder, "_find_by_structure", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                finder.find_project_root(search_methods=["markers", "structure"])
+
+    def test_result_is_cached(self):
+        self.env.touch("project", "pyproject.toml")
+        start = self.env.mkdir("project", "src")
+
+        finder = self._finder(start)
+        with patch.object(finder, "_find_nearest_by_markers", wraps=finder._find_nearest_by_markers) as mock:
+            finder.find_project_root(search_methods=["markers"])
+            finder.find_project_root(search_methods=["markers"])
+            mock.assert_called_once()
+
+    def test_unknown_method_skipped(self):
+        self.env.touch("project", "pyproject.toml")
+        start = self.env.mkdir("project", "src")
+
+        finder = self._finder(start)
+        result = finder.find_project_root(search_methods=["nonexistent", "markers"])
+        self.assertEqual(result, self.tmp / "project")
+
+
+class TestFindWorkspaceRoot(unittest.TestCase):
+    """Test find_workspace_root (farthest root)."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _finder(self, start: Path) -> ProjectRootFinder:
+        return ProjectRootFinder(start_path=str(start))
+
+    def test_root_marker_takes_priority(self):
+        """
+        workspace/      <- .root
+          service-a/    <- pyproject.toml
+            src/        <- start
+        .root at workspace should win.
+        """
+        self.env.touch("workspace", ROOT_MARKER)
+        self.env.touch("workspace", "service-a", "pyproject.toml")
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        result = finder.find_workspace_root(search_methods=["markers"])
+        self.assertEqual(result, self.tmp / "workspace")
+
+    def test_returns_farthest_marker_dir(self):
+        """
+        workspace/          <- .root (farthest, isolated from real fs)
+          service-a/        <- .root
+            src/            <- start
+        Should return workspace, not service-a.
+        """
+        self.env.touch("workspace", ROOT_MARKER)
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        # .root takes priority and picks the farthest
+        result = finder.find_workspace_root()
+        self.assertEqual(result, self.tmp / "workspace")
+
+    def test_farthest_root_marker_beats_nearer_one(self):
+        """
+        workspace/      <- .root (farthest)
+          service-a/    <- .root
+            src/        <- start
+        """
+        self.env.touch("workspace", ROOT_MARKER)
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        result = finder.find_workspace_root()
+        self.assertEqual(result, self.tmp / "workspace")
+
+    def test_raises_when_nothing_found(self):
+        start = self.env.mkdir("empty", "sub")
+
+        finder = self._finder(start)
+        with patch.object(finder, "_find_farthest_root_marker", return_value=None), \
+             patch.object(finder, "_find_farthest_by_markers", return_value=None), \
+             patch.object(finder, "_find_by_structure", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                finder.find_workspace_root(search_methods=["markers", "structure"])
+
+    def test_result_is_cached(self):
+        self.env.touch("workspace", "pyproject.toml")
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        with patch.object(finder, "_find_farthest_by_markers", wraps=finder._find_farthest_by_markers) as mock:
+            finder.find_workspace_root(search_methods=["markers"])
+            finder.find_workspace_root(search_methods=["markers"])
+            mock.assert_called_once()
+
+    def test_project_vs_workspace_differ_in_monorepo(self):
+        """
+        workspace/          <- .root (farthest)
+          service-a/        <- .root (nearest)
+            src/            <- start
+        project_root -> service-a, workspace_root -> workspace
+        """
+        self.env.touch("workspace", ROOT_MARKER)
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = self.env.mkdir("workspace", "service-a", "src")
+
+        finder = self._finder(start)
+        project = finder.find_project_root()
+        workspace = finder.find_workspace_root()
+
+        self.assertEqual(project, self.tmp / "workspace" / "service-a")
+        self.assertEqual(workspace, self.tmp / "workspace")
+        self.assertNotEqual(project, workspace)
+
+
+class TestNearestAndFarthestByMarkers(unittest.TestCase):
+    """Test _find_nearest_by_markers and _find_farthest_by_markers."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _finder(self, start: Path) -> ProjectRootFinder:
+        return ProjectRootFinder(start_path=str(start))
+
+    def test_nearest_returns_first_match(self):
+        markers = [_TEST_MARKER]
+        self.env.touch("a", _TEST_MARKER)
+        self.env.touch("a", "b", _TEST_MARKER)
+        start = self.env.mkdir("a", "b", "c")
+
+        finder = self._finder(start)
+        result = finder._find_nearest_by_markers(markers=markers)
+        self.assertEqual(result, self.tmp / "a" / "b")
+
+    def test_farthest_returns_last_match(self):
+        markers = [_TEST_MARKER]
+        self.env.touch("a", _TEST_MARKER)
+        self.env.touch("a", "b", _TEST_MARKER)
+        start = self.env.mkdir("a", "b", "c")
+
+        finder = self._finder(start)
+        result = finder._find_farthest_by_markers(markers=markers)
+        self.assertEqual(result, self.tmp / "a")
+
+    def test_nearest_returns_none_when_no_markers(self):
+        start = self.env.mkdir("empty", "sub")
+        finder = self._finder(start)
+        self.assertIsNone(finder._find_nearest_by_markers(markers=[_TEST_MARKER]))
+
+    def test_farthest_returns_none_when_no_markers(self):
+        start = self.env.mkdir("empty", "sub")
+        finder = self._finder(start)
+        self.assertIsNone(finder._find_farthest_by_markers(markers=[_TEST_MARKER]))
+
+    def test_single_match_nearest_equals_farthest(self):
+        markers = [_TEST_MARKER]
+        self.env.touch("a", _TEST_MARKER)
+        start = self.env.mkdir("a", "b", "c")
+
+        finder = self._finder(start)
+        nearest = finder._find_nearest_by_markers(markers=markers)
+        farthest = finder._find_farthest_by_markers(markers=markers)
+        self.assertEqual(nearest, farthest)
+        self.assertEqual(nearest, self.tmp / "a")
+
+
+class TestPublicAPI(unittest.TestCase):
+    """Test the public get_project_root and get_workspace_root functions."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name).resolve()
+        self.env = DirectoryEnvironment(self.tmp)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_get_project_root(self):
+        self.env.touch("workspace", "service-a", "pyproject.toml")
+        start = str(self.env.mkdir("workspace", "service-a", "src"))
+
+        result = get_project_root(start_path=start, search_methods=["markers"])
+        self.assertEqual(result, self.tmp / "workspace" / "service-a")
+
+    def test_get_workspace_root(self):
+        self.env.touch("workspace", ROOT_MARKER)
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = str(self.env.mkdir("workspace", "service-a", "src"))
+
+        result = get_workspace_root(start_path=start)
+        self.assertEqual(result, self.tmp / "workspace")
+
+    def test_get_project_root_with_root_marker(self):
+        self.env.touch("workspace", "pyproject.toml")
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = str(self.env.mkdir("workspace", "service-a", "src"))
+
+        result = get_project_root(start_path=start, search_methods=["markers"])
+        self.assertEqual(result, self.tmp / "workspace" / "service-a")
+
+    def test_get_workspace_root_with_root_marker(self):
+        self.env.touch("workspace", ROOT_MARKER)
+        self.env.touch("workspace", "service-a", ROOT_MARKER)
+        start = str(self.env.mkdir("workspace", "service-a", "src"))
+
+        result = get_workspace_root(start_path=start)
+        self.assertEqual(result, self.tmp / "workspace")
 
 
 class TestIsStdlibOrSitePackages(unittest.TestCase):

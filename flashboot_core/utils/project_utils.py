@@ -9,6 +9,9 @@ from loguru import logger
 # Root directory of this library, used to filter out internal frames from the call stack
 _LIBRARY_ROOT = Path(__file__).resolve().parent.parent
 
+# Explicit root marker file — place this file in a directory to mark it as a project root
+ROOT_MARKER = ".root"
+
 
 class ProjectRootFinder:
     """
@@ -43,21 +46,19 @@ class ProjectRootFinder:
             self.start_path = self._get_caller_project_path()
         else:
             self.start_path = Path(start_path).resolve()
-        self._cache: Optional[Path] = None
+        self._project_cache: Optional[Path] = None
+        self._workspace_cache: Optional[Path] = None
 
     def _get_caller_project_path(self) -> Path:
         """Determine the caller's project path using multiple fallback strategies."""
-        # Strategy 1: inspect the call stack for the first external frame
         caller_path = self._get_caller_from_stack()
         if caller_path:
             return caller_path
 
-        # Strategy 2: derive from the main script path (sys.argv[0])
         main_script = self._get_main_script_path()
         if main_script:
             return main_script
 
-        # Strategy 3: fall back to the current working directory
         return Path.cwd()
 
     def _get_caller_from_stack(self) -> Optional[Path]:
@@ -66,13 +67,11 @@ class ProjectRootFinder:
             stack = inspect.stack()
 
             for frame_info in stack[1:]:
-                # Skip Jupyter kernel temporary files
                 if "ipykernel_" in frame_info.filename:
                     continue
 
                 frame_file = Path(frame_info.filename).resolve()
 
-                # Skip frames from within this library and from stdlib/site-packages
                 if self._is_library_internal(frame_file):
                     continue
                 if self._is_stdlib_or_site_packages(frame_file):
@@ -99,7 +98,6 @@ class ProjectRootFinder:
         """Check whether the given path belongs to the standard library or third-party packages."""
         path_str = str(file_path).lower()
 
-        # Check against Python installation and virtual environment prefixes
         prefixes = [
             sys.prefix.lower(),
             sys.base_prefix.lower(),
@@ -107,7 +105,6 @@ class ProjectRootFinder:
         if any(path_str.startswith(p) for p in prefixes):
             return True
 
-        # Fallback: match common library path indicators
         library_indicators = [
             "site-packages",
             "dist-packages",
@@ -163,47 +160,85 @@ class ProjectRootFinder:
             pass
         return None
 
+    def _iter_ancestors(self) -> List[Path]:
+        """
+        Walk upward from start_path and return candidate directories (nearest first),
+        skipping known non-root dir names.
+        """
+        candidates = []
+        depth = 0
+        current = self.start_path
+
+        if current.is_file():
+            current = current.parent
+
+        while current != current.parent and depth < self._MAX_TRAVERSAL_DEPTH:
+            depth += 1
+
+            if not current.exists() or not current.is_dir():
+                current = current.parent
+                continue
+
+            if current.name in self._NON_ROOT_DIR_NAMES:
+                current = current.parent
+                continue
+
+            candidates.append(current)
+            current = current.parent
+
+        return candidates
+
+    def _find_nearest_root_marker(self) -> Optional[Path]:
+        """Return the nearest ancestor directory containing a .root file."""
+        for directory in self._iter_ancestors():
+            if (directory / ROOT_MARKER).exists():
+                return directory
+        return None
+
+    def _find_farthest_root_marker(self) -> Optional[Path]:
+        """Return the farthest ancestor directory containing a .root file."""
+        result = None
+        for directory in self._iter_ancestors():
+            if (directory / ROOT_MARKER).exists():
+                result = directory
+        return result
+
+    def _find_nearest_by_markers(self, markers: List[str] = None) -> Optional[Path]:
+        """Return the nearest ancestor directory containing at least one marker."""
+        if not markers:
+            markers = self._DEFAULT_MARKERS
+
+        for directory in self._iter_ancestors():
+            if any((directory / m).exists() for m in markers):
+                return directory
+
+        return None
+
+    def _find_farthest_by_markers(self, markers: List[str] = None) -> Optional[Path]:
+        """Return the farthest ancestor directory containing at least one marker."""
+        if not markers:
+            markers = self._DEFAULT_MARKERS
+
+        result = None
+        for directory in self._iter_ancestors():
+            if any((directory / m).exists() for m in markers):
+                result = directory
+
+        return result
+
     def _find_by_markers(self, markers: List[str] = None) -> Optional[Path]:
         """
-        Traverse upward from start_path, scoring each directory by how many
-        marker files/dirs it contains. The directory with the highest score wins.
+        Scoring-based marker search: returns the directory with the highest
+        marker count. Used as a legacy fallback.
         """
-        if self.start_path is None:
-            return None
-
         if not markers:
             markers = self._DEFAULT_MARKERS
 
         candidates = {}
-        depth = 0
-        current = self.start_path
-
-        # Ensure we start from a directory, not a file
-        if current.is_file():
-            current = current.parent
-
-        try:
-            while current != current.parent and depth < self._MAX_TRAVERSAL_DEPTH:
-                depth += 1
-
-                if not current.exists() or not current.is_dir():
-                    current = current.parent
-                    continue
-
-                # Skip directories that are clearly not project roots
-                if current.name in self._NON_ROOT_DIR_NAMES:
-                    current = current.parent
-                    continue
-
-                marker_count = sum(
-                    1 for marker in markers if (current / marker).exists()
-                )
-                if marker_count > 0:
-                    candidates[current] = marker_count
-
-                current = current.parent
-        except Exception:
-            pass
+        for directory in self._iter_ancestors():
+            score = sum(1 for m in markers if (directory / m).exists())
+            if score > 0:
+                candidates[directory] = score
 
         if not candidates:
             return None
@@ -215,28 +250,37 @@ class ProjectRootFinder:
         Traverse upward looking for a directory that contains src/ or lib/
         alongside Python files — a common project layout convention.
         """
-        depth = 0
-        current = self.start_path
-
-        while current != current.parent and depth < self._MAX_TRAVERSAL_DEPTH:
-            depth += 1
-            src_dir = current / "src"
-            lib_dir = current / "lib"
+        for directory in self._iter_ancestors():
+            src_dir = directory / "src"
+            lib_dir = directory / "lib"
             if (src_dir.exists() and src_dir.is_dir()) or (
                 lib_dir.exists() and lib_dir.is_dir()
             ):
-                if list(current.glob("*.py")):
-                    return current
-            current = current.parent
+                if list(directory.glob("*.py")):
+                    return directory
+
         return None
 
-    def find_root(self, search_methods: List[str] = None) -> Path:
+    def find_project_root(self, search_methods: List[str] = None) -> Path:
         """
-        Find the project root by trying each search method in order.
+        Find the nearest project root — the closest ancestor that looks like
+        a project root. Suitable for sub-projects and sub-modules.
+
+        Search order:
+        1. Nearest .root marker file (optional, explicit override)
+        2. VCS commands (git/svn/hg)
+        3. Nearest directory with marker files
+        4. Nearest directory matching src/lib structure
+
         Returns the first successful result, or raises FileNotFoundError.
         """
-        if self._cache:
-            return self._cache
+        if self._project_cache:
+            return self._project_cache
+
+        nearest_root_marker = self._find_nearest_root_marker()
+        if nearest_root_marker:
+            self._project_cache = nearest_root_marker
+            return self._project_cache
 
         if search_methods is None:
             search_methods = ["git", "svn", "hg", "markers", "structure"]
@@ -245,7 +289,7 @@ class ProjectRootFinder:
             "git": self._find_by_git,
             "svn": self._find_by_svn,
             "hg": self._find_by_hg,
-            "markers": self._find_by_markers,
+            "markers": self._find_nearest_by_markers,
             "structure": self._find_by_structure,
         }
 
@@ -258,37 +302,104 @@ class ProjectRootFinder:
             try:
                 result = finder()
             except Exception as e:
-                logger.warning(
-                    f"Failed to find project root via '{method_name}': {e}"
-                )
+                logger.warning(f"Failed to find project root via '{method_name}': {e}")
                 continue
 
             if result:
-                self._cache = result
-                return result
+                self._project_cache = result
+                return self._project_cache
 
         raise FileNotFoundError("Unable to locate project root directory.")
 
+    def find_workspace_root(self, search_methods: List[str] = None) -> Path:
+        """
+        Find the top-level workspace root — the outermost ancestor that looks
+        like a project root. Suitable for monorepos and workspaces.
 
-def get_root_path(start_path: str = None, search_methods: List[str] = None) -> Path:
+        Search order:
+        1. Farthest .root marker file (optional, explicit override)
+        2. Farthest directory with marker files
+        3. Farthest directory matching src/lib structure
+
+        Returns the first successful result, or raises FileNotFoundError.
+        """
+        if self._workspace_cache:
+            return self._workspace_cache
+
+        farthest_root_marker = self._find_farthest_root_marker()
+        if farthest_root_marker:
+            self._workspace_cache = farthest_root_marker
+            return self._workspace_cache
+
+        if search_methods is None:
+            search_methods = ["markers", "structure"]
+
+        method_map = {
+            "markers": self._find_farthest_by_markers,
+            "structure": self._find_by_structure,
+        }
+
+        for method_name in search_methods:
+            finder = method_map.get(method_name)
+            if finder is None:
+                logger.warning(f"Unknown search method: {method_name}, skipping")
+                continue
+
+            try:
+                result = finder()
+            except Exception as e:
+                logger.warning(f"Failed to find workspace root via '{method_name}': {e}")
+                continue
+
+            if result:
+                self._workspace_cache = result
+                return self._workspace_cache
+
+        raise FileNotFoundError("Unable to locate workspace root directory.")
+
+    def find_root(self, search_methods: List[str] = None) -> Path:
+        """Alias for find_project_root, kept for internal test compatibility."""
+        return self.find_project_root(search_methods)
+
+
+def get_project_root(start_path: str = None, search_methods: List[str] = None) -> Path:
     """
-    Get the project root path.
+    Get the nearest project root — the closest ancestor that looks like a project root.
+    Suitable for sub-projects and sub-modules.
 
     :param start_path: directory to start searching from (default: auto-detect)
     :param search_methods: ordered list of strategies to try
                            (default: ["git", "svn", "hg", "markers", "structure"])
-    :return: resolved Path to the project root
+    :return: resolved Path to the nearest project root
     """
-    finder = ProjectRootFinder(start_path)
-    return finder.find_root(search_methods)
+    return ProjectRootFinder(start_path).find_project_root(search_methods)
 
 
-def ensure_search_path() -> None:
-    """Ensure the project root is on sys.path so that local imports work."""
-    root_path = str(get_root_path())
+def get_workspace_root(start_path: str = None, search_methods: List[str] = None) -> Path:
+    """
+    Get the top-level workspace root — the outermost ancestor that looks like a project root.
+    Suitable for monorepos and workspaces.
+
+    :param start_path: directory to start searching from (default: auto-detect)
+    :param search_methods: ordered list of strategies to try
+                           (default: ["markers", "structure"])
+    :return: resolved Path to the workspace root
+    """
+    return ProjectRootFinder(start_path).find_workspace_root(search_methods)
+
+
+def setup_import_path(root: Path = None) -> None:
+    """
+    Ensure the project root is on sys.path so that local imports work.
+
+    :param root: explicit root path to add; defaults to get_project_root()
+    """
+    if root is None:
+        root = get_project_root()
+    root_str = str(root)
     logger.debug(
-        f"Root path: {root_path}, please make sure it satisfies the project structure. "
+        f"Root path: {root_str}, please make sure it satisfies the project structure. "
         f"If not, add it to PYTHONPATH manually."
     )
-    if root_path not in sys.path:
-        sys.path.append(root_path)
+    if root_str not in sys.path:
+        sys.path.append(root_str)
